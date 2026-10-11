@@ -150,6 +150,16 @@ class RecorderHostApiImpl: WatchRecorderHostAPI {
         
         return deviceInfo
     }
+    
+    func requestWatchSync() {
+        if session.isReachable {
+            session.sendMessage(["method": "syncPending"], replyHandler: nil, errorHandler: { error in
+                self.session.transferUserInfo(["method": "syncPending"])
+            })
+        } else {
+            session.transferUserInfo(["method": "syncPending"])
+        }
+    }
 }
 
 

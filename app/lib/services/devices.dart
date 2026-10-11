@@ -231,12 +231,50 @@ class DeviceService {
   void start() {
     _status = DeviceServiceStatus.ready;
 
-    // TODO: Start watchdog to discover automatically, re-connect automatically
+    // Start watchdog to discover automatically, re-connect automatically
+    _startReconnectionWatchdog();
+  }
+
+  Timer? _reconnectionWatchdog;
+
+  void _startReconnectionWatchdog() {
+    _reconnectionWatchdog?.cancel();
+    // Try every minute, no retry limit — keep trying forever
+    _reconnectionWatchdog = Timer.periodic(const Duration(seconds: 60), (_) async {
+      if (_status != DeviceServiceStatus.ready) return;
+      if (_staleBondRecoveryRequired) return;
+
+      // Check each connected device; if disconnected, try to reconnect
+      for (final entry in _connections.entries.toList()) {
+        final deviceId = entry.key;
+        final connection = entry.value;
+        try {
+          final isConnected = await connection.transport.isConnected();
+          if (!isConnected) {
+            Logger.debug('[DeviceService] Watchdog: $deviceId disconnected, attempting reconnect');
+            await ensureConnection(deviceId, force: true);
+          }
+        } catch (e) {
+          Logger.debug('[DeviceService] Watchdog: error checking $deviceId: $e');
+        }
+      }
+
+      // Also run a discovery scan to pick up newly available devices
+      try {
+        await discover(timeout: 5);
+      } catch (e) {
+        Logger.debug('[DeviceService] Watchdog: discovery error: $e');
+      }
+    });
   }
 
   Future<void> stop() async {
     _status = DeviceServiceStatus.stop;
     onStatusChanged(_status);
+
+    // Stop the reconnection watchdog
+    _reconnectionWatchdog?.cancel();
+    _reconnectionWatchdog = null;
 
     // Stop all discoverers to prevent resource leaks and battery drain
     await stopDiscoverers();

@@ -7,32 +7,99 @@ import AVFoundation
 class WatchAudioRecorderViewModel: NSObject, WatchRecorderControlling {
     @Published var isRecording: Bool = false
     @Published private(set) var recordingStartedAt: Date?
+    @Published var hasPendingFiles: Bool = false
+    @Published var isStreaming: Bool = false
+    @Published var isPhoneReachable: Bool = false
+
+    /// Streaming mode: .stream sends audio to phone in real-time when reachable.
+    /// .local saves audio locally on the watch and syncs when phone reconnects.
+    enum StreamingMode: String {
+        case stream = "stream"
+        case local = "local"
+    }
+
+    @Published var streamingMode: StreamingMode = .stream
 
     var session: WCSession
     private var audioEngine: AVAudioEngine?
     private var inputNode: AVAudioInputNode?
     private var audioBuffer: AVAudioPCMBuffer?
     private var chunkIndex: Int = 0
-    private var isStreaming: Bool = false
     private var inputFormat: AVAudioFormat?
     private var audioConverter: AVAudioConverter?
     private var targetFormat: AVAudioFormat?
     private var detectedSampleRate: Double = 0.0
-    
+
     // Audio buffering for multi-second chunks
     private var chunkBuffer: Data = Data()
     private var bufferStartTime: Date?
     private let bufferDuration: TimeInterval = 1.5 // 1.5 second chunks
-    
+
+    // Local storage for offline recordings
+    private var sessionKey: String = UUID().uuidString
+    private var heartbeatTimer: Timer?
+    private let heartbeatInterval: TimeInterval = 10.0 // 10 second heartbeat
+
     init(session: WCSession = .default) {
         self.session = session
         super.init()
         self.session.delegate = self
         session.activate()
-        
+
         BatteryManager.shared.startBatteryMonitoring()
         BatteryManager.shared.sendWatchInfo()
+
+        // Start periodic sync of any pending recordings
+        WatchLocalStorage.shared.startPeriodicSync(session: session)
+
+        // Start heartbeat to keep session alive
+        startHeartbeat()
+
+        // Load saved streaming mode preference
+        if let savedMode = UserDefaults.standard.string(forKey: "watch_streaming_mode") {
+            if let mode = StreamingMode(rawValue: savedMode) {
+                self.streamingMode = mode
+            }
+        }
     }
+
+    deinit {
+        heartbeatTimer?.invalidate()
+        WatchLocalStorage.shared.stopPeriodicSync()
+    }
+
+    // MARK: - Streaming Mode
+
+    func setStreamingMode(_ mode: StreamingMode) {
+        streamingMode = mode
+        UserDefaults.standard.set(mode.rawValue, forKey: "watch_streaming_mode")
+        print("WatchAudioRecorderViewModel: Streaming mode set to \(mode.rawValue)")
+    }
+
+    // MARK: - Heartbeat
+
+    private func startHeartbeat() {
+        heartbeatTimer = Timer.scheduledTimer(withTimeInterval: heartbeatInterval, repeats: true) { [weak self] _ in
+            guard let self = self else { return }
+            self.sendHeartbeat()
+        }
+    }
+
+    private func sendHeartbeat() {
+        let heartbeatData: [String: Any] = [
+            "method": "heartbeat",
+            "timestamp": Date().timeIntervalSince1970
+        ]
+        if session.isReachable {
+            session.sendMessage(heartbeatData, replyHandler: nil)
+            isPhoneReachable = true
+        } else {
+            session.transferUserInfo(heartbeatData)
+            isPhoneReachable = false
+        }
+    }
+
+    // MARK: - Recording
 
     func startRecording() {
         guard !isRecording else {
@@ -49,7 +116,8 @@ class WatchAudioRecorderViewModel: NSObject, WatchRecorderControlling {
                 self.setupAudioStreaming()
                 self.recordingStartedAt = Date()
                 self.isRecording = true
-                self.session.sendMessage(["method": "startRecording"], replyHandler: nil)
+                self.sessionKey = UUID().uuidString
+                self.session.sendMessage(["method": "startRecording", "sessionKey": self.sessionKey], replyHandler: nil)
             } else {
                 self.session.sendMessage(["method": "recordingError", "error": "Microphone permission denied"], replyHandler: nil)
             }
@@ -78,75 +146,83 @@ class WatchAudioRecorderViewModel: NSObject, WatchRecorderControlling {
 
         // Send any remaining buffered data and final chunk
         sendFinalAudioChunk()
-        
+
         // Reset buffer state
         chunkBuffer = Data()
         bufferStartTime = nil
 
-        session.sendMessage(["method": "stopRecording"], replyHandler: nil)
+        session.sendMessage(["method": "stopRecording", "sessionKey": sessionKey], replyHandler: nil)
     }
+
+    // MARK: - Audio Buffering & Sending
 
     private func bufferAndSendAudioData(_ audioData: Data) {
         // Initialize buffer start time on first data
         if bufferStartTime == nil {
             bufferStartTime = Date()
         }
-        
+
         // Add data to buffer
         chunkBuffer.append(audioData)
-        
+
         // Check if we've buffered for target duration
         let currentTime = Date()
         guard let startTime = bufferStartTime else { return }
         let elapsedTime = currentTime.timeIntervalSince(startTime)
-        
+
         if elapsedTime >= bufferDuration {
             // Send the accumulated buffer
             sendBufferedAudioChunk()
-            
+
             // Reset buffer for next window
             chunkBuffer = Data()
             bufferStartTime = currentTime
         }
     }
-    
+
     private func sendBufferedAudioChunk() {
         guard !chunkBuffer.isEmpty else { return }
-        
+
         let messageData: [String: Any] = [
             "method": "sendAudioChunk",
             "audioChunk": chunkBuffer,
             "chunkIndex": chunkIndex,
             "isLast": false,
-            "sampleRate": 16000.0
+            "sampleRate": 16000.0,
+            "sessionKey": sessionKey
         ]
-        
-        if session.isReachable {
+
+        // Decide: stream to phone or save locally
+        if streamingMode == .stream && session.isReachable {
+            // Stream to phone in real-time
             session.sendMessage(messageData, replyHandler: nil) { error in
-                // Fallback to transferUserInfo for background reliability
-                self.session.transferUserInfo(messageData)
+                // Phone became unreachable mid-send — save locally
+                self.saveChunkLocally(chunkBuffer, chunkIndex: chunkIndex)
+                self.chunkIndex += 1
             }
         } else {
-            // Use transferUserInfo when not reachable (background/screen off)
-            session.transferUserInfo(messageData)
+            // Save locally (either in local mode or phone unreachable)
+            saveChunkLocally(chunkBuffer, chunkIndex: chunkIndex)
+            chunkIndex += 1
         }
-        
+
         chunkIndex += 1
     }
-    
+
     private func sendFinalAudioChunk() {
         if !chunkBuffer.isEmpty {
             sendBufferedAudioChunk()
         }
-        
+
         let finalMessageData: [String: Any] = [
             "method": "sendAudioChunk",
             "audioChunk": Data(),
             "chunkIndex": chunkIndex,
             "isLast": true,
-            "sampleRate": 16000.0
+            "sampleRate": 16000.0,
+            "sessionKey": sessionKey
         ]
-        
+
         if session.isReachable {
             session.sendMessage(finalMessageData, replyHandler: nil) { error in
                 self.session.transferUserInfo(finalMessageData)
@@ -154,21 +230,44 @@ class WatchAudioRecorderViewModel: NSObject, WatchRecorderControlling {
         } else {
             session.transferUserInfo(finalMessageData)
         }
-        
     }
+
+    // MARK: - Local Storage
+
+    private func saveChunkLocally(_ data: Data, chunkIndex: Int) {
+        let url = WatchLocalStorage.shared.saveChunk(data, chunkIndex: chunkIndex, sessionKey: sessionKey)
+        if url != nil {
+            print("WatchAudioRecorderViewModel: Saved chunk \(chunkIndex) locally")
+            hasPendingFiles = WatchLocalStorage.shared.hasPendingFiles
+        }
+    }
+
+    /// Manually trigger a sync of pending recordings to the phone.
+    func syncPendingToPhone() {
+        guard session.isReachable else {
+            print("WatchAudioRecorderViewModel: Cannot sync — phone not reachable")
+            return
+        }
+        WatchLocalStorage.shared.syncToPhone(session: session) {
+            print("WatchAudioRecorderViewModel: Manual sync complete")
+            self.hasPendingFiles = WatchLocalStorage.shared.hasPendingFiles
+        }
+    }
+
+    // MARK: - Permissions
 
     private func checkMicrophonePermissionAndSetup(completion: @escaping (Bool) -> Void) {
         let audioSession = AVAudioSession.sharedInstance()
-        
+
         let permissionStatus = audioSession.recordPermission
-        
+
         switch permissionStatus {
         case .granted:
             setupAudioSessionAfterPermission(completion: completion)
-            
+
         case .denied:
             completion(false)
-            
+
         case .undetermined:
             // Request permission
             audioSession.requestRecordPermission { [weak self] granted in
@@ -180,17 +279,17 @@ class WatchAudioRecorderViewModel: NSObject, WatchRecorderControlling {
                     }
                 }
             }
-            
+
         @unknown default:
             completion(false)
         }
     }
-    
+
     private func setupAudioSessionAfterPermission(completion: @escaping (Bool) -> Void) {
         let audioSession = AVAudioSession.sharedInstance()
-        
+
         do {
-            try audioSession.setCategory(.playAndRecord, 
+            try audioSession.setCategory(.playAndRecord,
                                        mode: .default,
                                        options: [.mixWithOthers, .allowBluetooth])
             try audioSession.setActive(true, options: .notifyOthersOnDeactivation)
@@ -201,33 +300,35 @@ class WatchAudioRecorderViewModel: NSObject, WatchRecorderControlling {
     }
 
     func requestMicrophonePermissionOnly() {
-        
+
         let audioSession = AVAudioSession.sharedInstance()
         let permissionStatus = audioSession.recordPermission
-        
+
         switch permissionStatus {
         case .granted:
             session.sendMessage(["method": "microphonePermissionResult", "granted": true], replyHandler: nil)
-            
+
         case .denied:
             session.sendMessage(["method": "microphonePermissionResult", "granted": false], replyHandler: nil)
-            
+
         case .undetermined:
             // Request permission - this will show the permission dialog
             audioSession.requestRecordPermission { [weak self] granted in
                 DispatchQueue.main.async {
                     self?.session.sendMessage([
-                        "method": "microphonePermissionResult", 
+                        "method": "microphonePermissionResult",
                         "granted": granted
                     ], replyHandler: nil)
                 }
             }
-            
+
         @unknown default:
             // Send failure result to main app
             session.sendMessage(["method": "microphonePermissionResult", "granted": false], replyHandler: nil)
         }
     }
+
+    // MARK: - Audio Streaming
 
     private func setupAudioStreaming() {
 
@@ -346,13 +447,32 @@ class WatchAudioRecorderViewModel: NSObject, WatchRecorderControlling {
     }
 }
 
+// MARK: - WCSessionDelegate
+
 extension WatchAudioRecorderViewModel: WCSessionDelegate {
 #if os(iOS)
-    public func sessionDidBecomeInactive(_ session: WCSession) { }
-    public func sessionDidDeactivate(_ session: WCSession) { }
+    public func sessionDidBecomeInactive(_ session: WCSession) {
+        print("WatchAudioRecorderViewModel: Session became inactive")
+        isPhoneReachable = false
+    }
+    public func sessionDidDeactivate(_ session: WCSession) {
+        print("WatchAudioRecorderViewModel: Session deactivated")
+        isPhoneReachable = false
+    }
 #endif
-    func session(_ session: WCSession, activationDidCompleteWith activationState: WCSessionActivationState, error: (any Error)?) {}
-    
+
+    func session(_ session: WCSession, activationDidCompleteWith activationState: WCSessionActivationState, error: (any Error)?) {
+        if activationState == .activated {
+            print("WatchAudioRecorderViewModel: Session activated — syncing pending recordings")
+            isPhoneReachable = true
+            // Sync any pending recordings when session becomes active
+            WatchLocalStorage.shared.syncToPhone(session: session) {
+                print("WatchAudioRecorderViewModel: Sync complete")
+                self.hasPendingFiles = WatchLocalStorage.shared.hasPendingFiles
+            }
+        }
+    }
+
     func session(_ session: WCSession, didReceiveMessage message: [String : Any]) {
         Task {
             guard let method = message["method"] as? String else { return }
@@ -367,12 +487,22 @@ extension WatchAudioRecorderViewModel: WCSessionDelegate {
                 BatteryManager.shared.sendBatteryLevel()
             case "requestWatchInfo":
                 BatteryManager.shared.sendWatchInfo()
+            case "syncPending":
+                // Phone is requesting a sync of pending recordings
+                WatchLocalStorage.shared.syncToPhone(session: self.session) {
+                    self.hasPendingFiles = WatchLocalStorage.shared.hasPendingFiles
+                }
+            case "setStreamingMode":
+                if let modeString = message["mode"] as? String,
+                   let mode = StreamingMode(rawValue: modeString) {
+                    self.setStreamingMode(mode)
+                }
             default:
                 print("Unknown method: \(method)")
             }
         }
     }
-    
+
     func session(_ session: WCSession, didReceiveUserInfo userInfo: [String : Any]) {
         Task {
             guard let method = userInfo["method"] as? String else { return }
@@ -381,6 +511,15 @@ extension WatchAudioRecorderViewModel: WCSessionDelegate {
                 BatteryManager.shared.sendBatteryLevel()
             case "requestWatchInfo":
                 BatteryManager.shared.sendWatchInfo()
+            case "syncPending":
+                WatchLocalStorage.shared.syncToPhone(session: self.session) {
+                    self.hasPendingFiles = WatchLocalStorage.shared.hasPendingFiles
+                }
+            case "setStreamingMode":
+                if let modeString = userInfo["mode"] as? String,
+                   let mode = StreamingMode(rawValue: modeString) {
+                    self.setStreamingMode(mode)
+                }
             default:
                 print("Unknown background method: \(method)")
             }

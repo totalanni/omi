@@ -649,6 +649,11 @@ final class QuickActionsIconPatcher: NSObject {
   override func applicationDidBecomeActive(_ application: UIApplication) {
     OmiBleManager.shared.markBackgroundTelemetryEnd()
     super.applicationDidBecomeActive(application)
+    // Re-activate WCSession and trigger Watch sync when app returns to foreground
+    if let watchSession = self.session {
+      watchSession.activate()
+      watchSession.sendMessage(["method": "syncPending"], replyHandler: nil)
+    }
   }
 
   // Meta AI app calls back into this app to finish Ray-Ban Meta registration
@@ -912,6 +917,28 @@ extension AppDelegate: WCSessionDelegate {
                     try? SafeDefaults.store(.string(localizedModel), forKey: "watch_localized_model")
                     try? SafeDefaults.store(.date(Date()), forKey: "watch_info_last_updated")
                 }
+            case "syncPendingRecording":
+                // Receive a pending recording chunk from the watch (offline sync)
+                if let audioData = message["audioData"] as? Data,
+                   let sessionKey = message["sessionKey"] as? String,
+                   let chunkIndex = message["chunkIndex"] as? Int {
+                    print("iOS: Received pending recording chunk \(chunkIndex) (session: \(sessionKey))")
+                    // Prepend 3 dummy bytes for single-shot audio data
+                    var prefixed = Data([0x00, 0x00, 0x00])
+                    prefixed.append(audioData)
+                    let flutterData = FlutterStandardTypedData(bytes: prefixed)
+                    self.flutterWatchAPI?.onAudioData(audioData: flutterData) { result in
+                        switch result {
+                        case .success:
+                            break
+                        case .failure(let error):
+                            print("iOS: Pending recording sync failed - Error: \(error.message)")
+                        }
+                    }
+                }
+            case "heartbeat":
+                // Watch heartbeat — ignore (session is alive)
+                break
             default:
                 print("Unknown method: \(method)")
             }
@@ -980,6 +1007,27 @@ extension AppDelegate: WCSessionDelegate {
                     try? SafeDefaults.store(.string(localizedModel), forKey: "watch_localized_model")
                     try? SafeDefaults.store(.date(Date()), forKey: "watch_info_last_updated")
                 }
+            case "syncPendingRecording":
+                // Receive a pending recording chunk from the watch (offline sync, background)
+                if let audioData = userInfo["audioData"] as? Data,
+                   let sessionKey = userInfo["sessionKey"] as? String,
+                   let chunkIndex = userInfo["chunkIndex"] as? Int {
+                    print("iOS: Received pending recording chunk \(chunkIndex) (session: \(sessionKey)) [background]")
+                    var prefixed = Data([0x00, 0x00, 0x00])
+                    prefixed.append(audioData)
+                    let flutterData = FlutterStandardTypedData(bytes: prefixed)
+                    self.flutterWatchAPI?.onAudioData(audioData: flutterData) { result in
+                        switch result {
+                        case .success:
+                            break
+                        case .failure(let error):
+                            print("iOS: Pending recording sync (background) failed - Error: \(error.message)")
+                        }
+                    }
+                }
+            case "heartbeat":
+                // Watch heartbeat — ignore (session is alive)
+                break
             default:
                 print("Unknown background method: \(method)")
             }

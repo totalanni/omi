@@ -46,6 +46,8 @@ abstract class WatchRecorderHostAPI {
   void requestWatchBatteryUpdate();
   @SwiftFunction('getWatchInfo()')
   Map<String, String> getWatchInfo();
+  @SwiftFunction('requestWatchSync()')
+  void requestWatchSync();
 }
 
 @FlutterApi()

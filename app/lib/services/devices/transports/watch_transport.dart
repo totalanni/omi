@@ -304,6 +304,14 @@ class WatchTransport extends DeviceTransport {
     }
   }
 
+  Future<void> requestWatchSync() async {
+    try {
+      await _hostAPI.requestWatchSync();
+    } catch (e) {
+      Logger.debug('Watch Transport: Error requesting watch sync: $e');
+    }
+  }
+
   @override
   Future<void> dispose() async {
     for (final timer in _periodicTimers.values) {

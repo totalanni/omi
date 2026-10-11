@@ -27,6 +27,23 @@ class AppleWatchDeviceConnection extends DeviceConnection {
 
     // Check for any recording that should be restarted
     await checkAndStartRecordingOnRelaunch();
+
+    // Trigger sync of any pending recordings from the watch
+    await _triggerPendingSync();
+  }
+
+  /// Trigger a sync of pending recordings from the watch to the phone.
+  Future<void> _triggerPendingSync() async {
+    try {
+      if (transport is WatchTransport) {
+        final watchTransport = transport as WatchTransport;
+        // Send a sync request to the watch
+        await watchTransport.requestWatchSync();
+        Logger.debug('Apple Watch: Triggered pending sync');
+      }
+    } catch (e) {
+      Logger.debug('Apple Watch: Error triggering pending sync: $e');
+    }
   }
 
   /// Returns true if recording started, false if permission is needed
